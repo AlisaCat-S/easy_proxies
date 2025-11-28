@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -93,7 +94,8 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	payload := map[string]any{"nodes": s.mgr.Snapshot()}
+	// 只返回初始检查通过的可用节点
+	payload := map[string]any{"nodes": s.mgr.SnapshotFiltered(true)}
 	writeJSON(w, payload)
 }
 
@@ -226,24 +228,34 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExport 导出所有节点的 URI，每行一个
+// handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	snapshots := s.mgr.Snapshot()
+	// 只导出初始检查通过的可用节点
+	snapshots := s.mgr.SnapshotFiltered(true)
 	var lines []string
 
 	for _, snap := range snapshots {
-		if snap.URI != "" {
-			lines = append(lines, snap.URI)
+		// 只导出有监听地址和端口的节点（代理池节点）
+		if snap.ListenAddress != "" && snap.Port > 0 {
+			var proxyURI string
+			if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
+				proxyURI = fmt.Sprintf("http://%s:%s@%s:%d",
+					s.cfg.ProxyUsername, s.cfg.ProxyPassword,
+					snap.ListenAddress, snap.Port)
+			} else {
+				proxyURI = fmt.Sprintf("http://%s:%d", snap.ListenAddress, snap.Port)
+			}
+			lines = append(lines, proxyURI)
 		}
 	}
 
 	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", "attachment; filename=nodes.txt")
+	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 }

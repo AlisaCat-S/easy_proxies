@@ -16,9 +16,12 @@ import (
 
 // Config mirrors user settings needed by the monitoring server.
 type Config struct {
-	Enabled     bool
-	Listen      string
-	ProbeTarget string
+	Enabled       bool
+	Listen        string
+	ProbeTarget   string
+	Password      string
+	ProxyUsername string // 代理池的用户名（用于导出）
+	ProxyPassword string // 代理池的密码（用于导出）
 }
 
 // NodeInfo is static metadata about a proxy entry.
@@ -43,6 +46,8 @@ type Snapshot struct {
 	LastSuccess       time.Time     `json:"last_success,omitempty"`
 	LastProbeLatency  time.Duration `json:"last_probe_latency,omitempty"`
 	LastLatencyMs     int64         `json:"last_latency_ms"`
+	Available         bool          `json:"available"`          // 节点是否可用
+	InitialCheckDone  bool          `json:"initial_check_done"` // 初始检查是否完成
 }
 
 type probeFunc func(ctx context.Context) (time.Duration, error)
@@ -53,18 +58,20 @@ type EntryHandle struct {
 }
 
 type entry struct {
-	info      NodeInfo
-	failure   int
-	blacklist bool
-	until     time.Time
-	lastError string
-	lastFail  time.Time
-	lastOK    time.Time
-	lastProbe time.Duration
-	active    atomic.Int32
-	probe     probeFunc
-	release   releaseFunc
-	mu        sync.RWMutex
+	info             NodeInfo
+	failure          int
+	blacklist        bool
+	until            time.Time
+	lastError        string
+	lastFail         time.Time
+	lastOK           time.Time
+	lastProbe        time.Duration
+	active           atomic.Int32
+	probe            probeFunc
+	release          releaseFunc
+	initialCheckDone bool // 初始健康检查是否完成
+	available        bool // 节点是否可用（初始检查通过）
+	mu               sync.RWMutex
 }
 
 // Manager aggregates all node states for the UI/API.
@@ -74,14 +81,30 @@ type Manager struct {
 	probeReady bool
 	mu         sync.RWMutex
 	nodes      map[string]*entry
+	ctx        context.Context
+	cancel     context.CancelFunc
+	logger     Logger
+}
+
+// Logger interface for logging
+type Logger interface {
+	Info(args ...any)
+	Warn(args ...any)
 }
 
 // NewManager constructs a manager and pre-validates the probe target.
 func NewManager(cfg Config) (*Manager, error) {
-	m := &Manager{cfg: cfg, nodes: make(map[string]*entry)}
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Manager{
+		cfg:    cfg,
+		nodes:  make(map[string]*entry),
+		ctx:    ctx,
+		cancel: cancel,
+	}
 	if cfg.ProbeTarget != "" {
 		host, port, err := net.SplitHostPort(cfg.ProbeTarget)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
@@ -89,6 +112,110 @@ func NewManager(cfg Config) (*Manager, error) {
 		m.probeReady = true
 	}
 	return m, nil
+}
+
+// SetLogger sets the logger for the manager.
+func (m *Manager) SetLogger(logger Logger) {
+	m.logger = logger
+}
+
+// StartPeriodicHealthCheck starts a background goroutine that periodically checks all nodes.
+// interval: how often to check (e.g., 30 * time.Second)
+// timeout: timeout for each probe (e.g., 10 * time.Second)
+func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
+	if !m.probeReady {
+		if m.logger != nil {
+			m.logger.Warn("probe target not configured, periodic health check disabled")
+		}
+		return
+	}
+
+	go func() {
+		// 启动后立即进行一次检查
+		m.probeAllNodes(timeout)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-ticker.C:
+				m.probeAllNodes(timeout)
+			}
+		}
+	}()
+
+	if m.logger != nil {
+		m.logger.Info("periodic health check started, interval: ", interval)
+	}
+}
+
+// probeAllNodes checks all registered nodes.
+func (m *Manager) probeAllNodes(timeout time.Duration) {
+	m.mu.RLock()
+	entries := make([]*entry, 0, len(m.nodes))
+	for _, e := range m.nodes {
+		entries = append(entries, e)
+	}
+	m.mu.RUnlock()
+
+	if len(entries) == 0 {
+		return
+	}
+
+	if m.logger != nil {
+		m.logger.Info("starting health check for ", len(entries), " nodes")
+	}
+
+	availableCount := 0
+	failedCount := 0
+
+	for _, e := range entries {
+		e.mu.RLock()
+		probeFn := e.probe
+		tag := e.info.Tag
+		e.mu.RUnlock()
+
+		if probeFn == nil {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(m.ctx, timeout)
+		latency, err := probeFn(ctx)
+		cancel()
+
+		e.mu.Lock()
+		if err != nil {
+			failedCount++
+			e.lastError = err.Error()
+			e.lastFail = time.Now()
+			e.available = false
+			e.initialCheckDone = true
+			if m.logger != nil {
+				m.logger.Warn("probe failed for ", tag, ": ", err)
+			}
+		} else {
+			availableCount++
+			e.lastOK = time.Now()
+			e.lastProbe = latency
+			e.available = true
+			e.initialCheckDone = true
+		}
+		e.mu.Unlock()
+	}
+
+	if m.logger != nil {
+		m.logger.Info("health check completed: ", availableCount, " available, ", failedCount, " failed")
+	}
+}
+
+// Stop stops the periodic health check.
+func (m *Manager) Stop() {
+	if m.cancel != nil {
+		m.cancel()
+	}
 }
 
 func parsePort(value string) uint16 {
@@ -122,7 +249,15 @@ func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 }
 
 // Snapshot returns a sorted copy of current node states.
+// If onlyAvailable is true, only returns nodes that passed initial health check.
 func (m *Manager) Snapshot() []Snapshot {
+	return m.SnapshotFiltered(false)
+}
+
+// SnapshotFiltered returns a sorted copy of current node states.
+// If onlyAvailable is true, only returns nodes that passed initial health check.
+// Nodes that haven't been checked yet are also included (they will be checked on first use).
+func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 	m.mu.RLock()
 	list := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -131,7 +266,14 @@ func (m *Manager) Snapshot() []Snapshot {
 	m.mu.RUnlock()
 	snapshots := make([]Snapshot, 0, len(list))
 	for _, e := range list {
-		snapshots = append(snapshots, e.snapshot())
+		snap := e.snapshot()
+		// 如果只要可用节点：
+		// - 跳过已完成检查但不可用的节点
+		// - 保留未完成检查的节点（它们会在首次使用时被检查）
+		if onlyAvailable && snap.InitialCheckDone && !snap.Available {
+			continue
+		}
+		snapshots = append(snapshots, snap)
 	}
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i].Name < snapshots[j].Name
@@ -199,6 +341,8 @@ func (e *entry) snapshot() Snapshot {
 		LastSuccess:       e.lastOK,
 		LastProbeLatency:  e.lastProbe,
 		LastLatencyMs:     latencyMs,
+		Available:         e.available,
+		InitialCheckDone:  e.initialCheckDone,
 	}
 }
 
@@ -318,4 +462,25 @@ func (h *EntryHandle) SetRelease(fn func()) {
 		return
 	}
 	h.ref.setRelease(fn)
+}
+
+// MarkInitialCheckDone marks the initial health check as completed.
+func (h *EntryHandle) MarkInitialCheckDone(available bool) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	h.ref.initialCheckDone = true
+	h.ref.available = available
+	h.ref.mu.Unlock()
+}
+
+// MarkAvailable updates the availability status.
+func (h *EntryHandle) MarkAvailable(available bool) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	h.ref.available = available
+	h.ref.mu.Unlock()
 }

@@ -159,8 +159,16 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.initializeMembersLocked()
+	err := p.initializeMembersLocked()
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	// 在初始化完成后，立即在后台触发健康检查
+	if p.monitor != nil {
+		go p.probeAllMembersOnStartup()
+	}
+	return nil
 }
 
 // initializeMembersLocked must be called with p.mu held
@@ -204,11 +212,6 @@ func (p *poolOutbound) initializeMembersLocked() error {
 	p.members = members
 	p.logger.Info("pool initialized with ", len(members), " members")
 
-	// Probe all members in background to check initial health status
-	if p.monitor != nil {
-		go p.probeAllMembersOnStartup()
-	}
-
 	return nil
 }
 
@@ -217,6 +220,14 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	destination, ok := p.monitor.DestinationForProbe()
 	if !ok {
 		p.logger.Warn("probe target not configured, skipping initial health check")
+		// 没有配置探测目标时，标记所有节点为可用
+		p.mu.Lock()
+		for _, member := range p.members {
+			if member.entry != nil {
+				member.entry.MarkInitialCheckDone(true)
+			}
+		}
+		p.mu.Unlock()
 		return
 	}
 
@@ -226,6 +237,9 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	members := make([]*memberState, len(p.members))
 	copy(members, p.members)
 	p.mu.Unlock()
+
+	availableCount := 0
+	failedCount := 0
 
 	for _, member := range members {
 		// Create a timeout context for each probe
@@ -237,21 +251,25 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 
 		if err != nil {
 			p.logger.Warn("initial probe failed for ", member.tag, ": ", err)
+			failedCount++
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
+				member.entry.MarkInitialCheckDone(false) // 标记为不可用
 			}
 		} else {
 			_ = conn.Close()
 			p.logger.Info("initial probe success for ", member.tag, ", latency: ", latency.Milliseconds(), "ms")
+			availableCount++
 			if member.entry != nil {
 				member.entry.RecordSuccess()
+				member.entry.MarkInitialCheckDone(true) // 标记为可用
 			}
 		}
 
 		cancel()
 	}
 
-	p.logger.Info("initial health check completed")
+	p.logger.Info("initial health check completed: ", availableCount, " available, ", failedCount, " failed")
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

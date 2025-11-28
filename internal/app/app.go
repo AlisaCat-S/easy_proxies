@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
@@ -17,12 +18,34 @@ import (
 	"github.com/sagernet/sing-box/include"
 )
 
+// stdLogger adapts standard log to monitor.Logger interface
+type stdLogger struct{}
+
+func (l *stdLogger) Info(args ...any) {
+	log.Println(append([]any{"[health-check] "}, args...)...)
+}
+
+func (l *stdLogger) Warn(args ...any) {
+	log.Println(append([]any{"[health-check] ⚠️ "}, args...)...)
+}
+
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
+	// 根据模式选择代理用户名密码
+	proxyUsername := cfg.Listener.Username
+	proxyPassword := cfg.Listener.Password
+	if cfg.Mode == "multi_port" {
+		proxyUsername = cfg.MultiPort.Username
+		proxyPassword = cfg.MultiPort.Password
+	}
+
 	monitorCfg := monitor.Config{
-		Enabled:     cfg.ManagementEnabled(),
-		Listen:      cfg.Management.Listen,
-		ProbeTarget: cfg.Management.ProbeTarget,
+		Enabled:       cfg.ManagementEnabled(),
+		Listen:        cfg.Management.Listen,
+		ProbeTarget:   cfg.Management.ProbeTarget,
+		Password:      cfg.Management.Password,
+		ProxyUsername: proxyUsername,
+		ProxyPassword: proxyPassword,
 	}
 	monitorMgr, err := monitor.NewManager(monitorCfg)
 	if err != nil {
@@ -57,6 +80,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		monitorServer = monitor.NewServer(monitorCfg, monitorMgr, log.Default())
 		monitorServer.Start(ctx)
 		defer monitorServer.Shutdown(context.Background())
+
+		// 启动定期健康检查（每30秒检查一次，每个节点超时10秒）
+		monitorMgr.SetLogger(&stdLogger{})
+		monitorMgr.StartPeriodicHealthCheck(30*time.Second, 10*time.Second)
+		defer monitorMgr.Stop()
 	}
 
 	sigCh := make(chan os.Signal, 1)

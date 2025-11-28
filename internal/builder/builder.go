@@ -348,7 +348,22 @@ func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error
 	options := &option.V2RayTransportOptions{Type: transportType}
 	switch transportType {
 	case C.V2RayTransportTypeWebsocket:
-		options.WebsocketOptions.Path = query.Get("path")
+		wsPath := query.Get("path")
+		// 解析 path 中的 early data 参数，如 /path?ed=2048
+		if idx := strings.Index(wsPath, "?ed="); idx != -1 {
+			edPart := wsPath[idx+4:]
+			wsPath = wsPath[:idx]
+			// 解析 ed 值
+			edValue := edPart
+			if ampIdx := strings.Index(edPart, "&"); ampIdx != -1 {
+				edValue = edPart[:ampIdx]
+			}
+			if ed, err := strconv.Atoi(edValue); err == nil && ed > 0 {
+				options.WebsocketOptions.MaxEarlyData = uint32(ed)
+				options.WebsocketOptions.EarlyDataHeaderName = "Sec-WebSocket-Protocol"
+			}
+		}
+		options.WebsocketOptions.Path = wsPath
 		if host := query.Get("host"); host != "" {
 			options.WebsocketOptions.Headers = badoption.HTTPHeader{"Host": {host}}
 		}
