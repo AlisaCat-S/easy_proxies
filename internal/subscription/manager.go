@@ -510,7 +510,7 @@ func (m *Manager) createNewConfig(subNodes []config.NodeConfig) *config.Config {
 	inline := m.inlineNodes()
 	fileNodes := m.loadManualFileNodes()
 
-	merged := mergeNodesKeepFirst(append(append([]config.NodeConfig{}, inline...), subNodes...), fileNodes...)
+	merged := mergeNodesKeepFirst(append(append([]config.NodeConfig{}, inline...), subNodes...), fileNodes)
 
 	// Ensure names (extract from fragment if needed)
 	for i := range merged {
