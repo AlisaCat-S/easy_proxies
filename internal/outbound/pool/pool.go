@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"crypto/tls"
 
 	"easy_proxies/internal/monitor"
 
@@ -775,15 +776,42 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	return ttfb, nil
 }
 
+func httpsProbe(ctx context.Context, conn net.Conn, serverName, hostHeader string) (time.Duration, error) {
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+	}
+	if serverName != "" {
+		tlsCfg.ServerName = serverName
+	}
+
+	tlsConn := tls.Client(conn, tlsCfg)
+
+	// Best-effort deadline for handshake
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(deadline)
+	} else {
+		_ = tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
+	}
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return 0, fmt.Errorf("tls handshake: %w", err)
+	}
+
+	// After TLS handshake, do HTTP probe over TLS.
+	return httpProbe(tlsConn, hostHeader)
+}
+
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
+		destination, hostHeader, useTLS, serverName, ok := p.monitor.ProbeTargetInfo()
+		if !ok {
+			return 0, E.New("probe target not configured")
+		}
+
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
@@ -794,8 +822,11 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		if useTLS {
+			_, err = httpsProbe(ctx, conn, serverName, hostHeader)
+		} else {
+			_, err = httpProbe(conn, hostHeader)
+		}
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -803,7 +834,6 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 			return 0, err
 		}
 
-		// Total duration = dial time + HTTP probe
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)
@@ -817,11 +847,12 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
+		destination, hostHeader, useTLS, serverName, ok := p.monitor.ProbeTargetInfo()
+		if !ok {
+			return 0, E.New("probe target not configured")
+		}
+
 		// Ensure members are initialized
 		p.mu.Lock()
 		if len(p.members) == 0 {
@@ -855,8 +886,11 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		if useTLS {
+			_, err = httpsProbe(ctx, conn, serverName, hostHeader)
+		} else {
+			_, err = httpProbe(conn, hostHeader)
+		}
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -864,7 +898,6 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 			return 0, err
 		}
 
-		// Total duration = dial time + TTFB
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)

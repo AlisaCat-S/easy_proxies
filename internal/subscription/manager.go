@@ -75,16 +75,21 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 
 // Start begins the periodic refresh loop.
 func (m *Manager) Start() {
-	if !m.baseCfg.SubscriptionRefresh.Enabled {
+	cfg := m.cfgSnapshot()
+	if cfg == nil {
+		m.logger.Warnf("subscription refresh disabled: config is nil")
+		return
+	}
+	if !cfg.SubscriptionRefresh.Enabled {
 		m.logger.Infof("subscription refresh disabled")
 		return
 	}
-	if len(m.baseCfg.Subscriptions) == 0 {
+	if len(cfg.Subscriptions) == 0 {
 		m.logger.Infof("no subscriptions configured, refresh disabled")
 		return
 	}
 
-	interval := m.baseCfg.SubscriptionRefresh.Interval
+	interval := cfg.SubscriptionRefresh.Interval
 	m.logger.Infof("starting subscription refresh, interval: %s", interval)
 
 	go m.refreshLoop(interval)
@@ -104,12 +109,21 @@ func (m *Manager) RefreshNow() error {
 	default:
 	}
 
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	cfg := m.cfgSnapshot()
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+
+	timeout := cfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	hcTimeout := cfg.SubscriptionRefresh.HealthCheckTimeout
+	if hcTimeout <= 0 {
+		hcTimeout = 60 * time.Second
+	}
 
-	ctx, cancel := context.WithTimeout(m.ctx, timeout+m.baseCfg.SubscriptionRefresh.HealthCheckTimeout)
+	ctx, cancel := context.WithTimeout(m.ctx, timeout+hcTimeout)
 	defer cancel()
 
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -140,6 +154,15 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 
 	status.NodesModified = m.CheckNodesModified()
 	return status
+}
+
+func (m *Manager) cfgSnapshot() *config.Config {
+	if m.boxMgr != nil {
+		if snap := m.boxMgr.ConfigSnapshot(); snap != nil {
+			return snap
+		}
+	}
+	return m.baseCfg
 }
 
 func (m *Manager) refreshLoop(interval time.Duration) {
@@ -259,7 +282,11 @@ func (m *Manager) doRefresh() {
 }
 
 func (m *Manager) getManualNodesFilePath() string {
-	p := strings.TrimSpace(m.baseCfg.NodesFile)
+	cfg := m.cfgSnapshot()
+	if cfg == nil {
+		return ""
+	}
+	p := strings.TrimSpace(cfg.NodesFile)
 	if p == "" {
 		return ""
 	}
@@ -267,11 +294,12 @@ func (m *Manager) getManualNodesFilePath() string {
 }
 
 func (m *Manager) getSubscriptionCacheFilePath() string {
-	if m.baseCfg == nil {
+	cfg := m.cfgSnapshot()
+	if cfg == nil {
 		return ""
 	}
 
-	nodesFile := strings.TrimSpace(m.baseCfg.NodesFile)
+	nodesFile := strings.TrimSpace(cfg.NodesFile)
 	if nodesFile != "" {
 		dir := filepath.Dir(nodesFile)
 		base := filepath.Base(nodesFile)
@@ -283,7 +311,7 @@ func (m *Manager) getSubscriptionCacheFilePath() string {
 		return filepath.Join(dir, base)
 	}
 
-	cfgPath := strings.TrimSpace(m.baseCfg.FilePath())
+	cfgPath := strings.TrimSpace(cfg.FilePath())
 	if cfgPath == "" {
 		return ""
 	}
@@ -368,15 +396,21 @@ func (m *Manager) MarkNodesModified() {
 }
 
 func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
+	cfg := m.cfgSnapshot()
+	if cfg == nil {
+		return nil, fmt.Errorf("config is nil")
+	}
+
 	var allNodes []config.NodeConfig
 	var lastErr error
 
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	timeout := cfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
-	for _, subURL := range m.baseCfg.Subscriptions {
+	subs := append([]string(nil), cfg.Subscriptions...)
+	for _, subURL := range subs {
 		nodes, err := m.fetchSubscription(subURL, timeout)
 		if err != nil {
 			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
@@ -491,11 +525,13 @@ func (m *Manager) loadManualFileNodes() []config.NodeConfig {
 }
 
 func (m *Manager) inlineNodes() []config.NodeConfig {
-	if m.baseCfg == nil {
+	cfg := m.cfgSnapshot()
+	if cfg == nil {
 		return nil
 	}
+
 	var nodes []config.NodeConfig
-	for _, n := range m.baseCfg.Nodes {
+	for _, n := range cfg.Nodes {
 		if n.Source == config.NodeSourceInline {
 			nodes = append(nodes, n)
 		}
@@ -505,11 +541,22 @@ func (m *Manager) inlineNodes() []config.NodeConfig {
 
 // createNewConfig merges inline + subscription + file nodes.
 func (m *Manager) createNewConfig(subNodes []config.NodeConfig) *config.Config {
-	newCfg := *m.baseCfg
+	base := m.cfgSnapshot()
+	if base == nil {
+		return nil
+	}
 
-	inline := m.inlineNodes()
+	newCfg := *base
+
+	// Inline nodes from the same snapshot (avoid reading shared cfg directly).
+	inline := make([]config.NodeConfig, 0)
+	for _, n := range base.Nodes {
+		if n.Source == config.NodeSourceInline {
+			inline = append(inline, n)
+		}
+	}
+
 	fileNodes := m.loadManualFileNodes()
-
 	merged := mergeNodesKeepFirst(append(append([]config.NodeConfig{}, inline...), subNodes...), fileNodes)
 
 	// Ensure names (extract from fragment if needed)

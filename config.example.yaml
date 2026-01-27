@@ -57,7 +57,6 @@ nodes_file: nodes.txt
 #     port: 24001
 
 # 方式 3：subscriptions（推荐，支持 Base64 / Clash YAML / 纯文本）
-# 注意：配置 subscriptions 时，本项目会以订阅为主，并将解析出的节点写入 nodes_file（默认 nodes.txt）
 subscriptions:
   # Clash YAML（proxies:），支持 type: http / type: socks5
   # - "https://wslzgmzs.com/clash.yaml"

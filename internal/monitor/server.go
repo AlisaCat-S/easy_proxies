@@ -29,6 +29,10 @@ type NodeManager interface {
 	UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error)
 	DeleteNode(ctx context.Context, name string) error
 	TriggerReload(ctx context.Context) error
+
+	// Settings (thread-safe; implemented by boxmgr.Manager)
+	GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error)
+	UpdateSettings(ctx context.Context, externalIP, probeTarget string, skipCertVerify bool) error
 }
 
 // Sentinel errors for node operations.
@@ -52,7 +56,7 @@ type SubscriptionStatus struct {
 	LastError     string    `json:"last_error,omitempty"`
 	RefreshCount  int       `json:"refresh_count"`
 	IsRefreshing  bool      `json:"is_refreshing"`
-	NodesModified bool      `json:"nodes_modified"` // True if nodes.txt was modified since last refresh
+	NodesModified bool      `json:"nodes_modified"` 
 }
 
 // Server exposes HTTP endpoints for monitoring.
@@ -142,21 +146,73 @@ func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify b
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 
+	prevExternalIP := s.cfg.ExternalIP
+	prevProbeTarget := s.cfg.ProbeTarget
+	prevSkip := s.cfg.SkipCertVerify
+
+	var prevCfgSrcExternalIP string
+	var prevCfgSrcProbeTarget string
+	var prevCfgSrcSkip bool
+	if s.cfgSrc != nil {
+		prevCfgSrcExternalIP = s.cfgSrc.ExternalIP
+		prevCfgSrcProbeTarget = s.cfgSrc.Management.ProbeTarget
+		prevCfgSrcSkip = s.cfgSrc.SkipCertVerify
+	}
+
+	// Update in-memory server config first
 	s.cfg.ExternalIP = externalIP
 	s.cfg.ProbeTarget = probeTarget
 	s.cfg.SkipCertVerify = skipCertVerify
 
 	if s.cfgSrc == nil {
+		// rollback server cfg
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
 		return errors.New("配置存储未初始化")
 	}
 
+	// Update persistable config object
 	s.cfgSrc.ExternalIP = externalIP
 	s.cfgSrc.Management.ProbeTarget = probeTarget
 	s.cfgSrc.SkipCertVerify = skipCertVerify
 
+	// Apply probe target to runtime monitor manager (also validates probeTarget)
+	if s.mgr != nil {
+		if err := s.mgr.UpdateProbeTarget(probeTarget); err != nil {
+			// rollback server cfg
+			s.cfg.ExternalIP = prevExternalIP
+			s.cfg.ProbeTarget = prevProbeTarget
+			s.cfg.SkipCertVerify = prevSkip
+
+			// rollback cfgSrc
+			s.cfgSrc.ExternalIP = prevCfgSrcExternalIP
+			s.cfgSrc.Management.ProbeTarget = prevCfgSrcProbeTarget
+			s.cfgSrc.SkipCertVerify = prevCfgSrcSkip
+
+			return err
+		}
+	}
+
 	if err := s.cfgSrc.SaveSettings(); err != nil {
+		// rollback runtime manager (best-effort)
+		if s.mgr != nil {
+			_ = s.mgr.UpdateProbeTarget(prevProbeTarget)
+		}
+
+		// rollback server cfg
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
+
+		// rollback cfgSrc
+		s.cfgSrc.ExternalIP = prevCfgSrcExternalIP
+		s.cfgSrc.Management.ProbeTarget = prevCfgSrcProbeTarget
+		s.cfgSrc.SkipCertVerify = prevCfgSrcSkip
+
 		return fmt.Errorf("保存配置失败: %w", err)
 	}
+
 	return nil
 }
 
@@ -597,30 +653,54 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
-// 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 只导出初始检查通过的可用节点
-	snapshots := s.mgr.SnapshotFiltered(true)
-	var lines []string
+	// Export ONLY nodes that are available in the latest health-check result.
+	// Also skip blacklisted nodes.
+	snapshots := s.mgr.Snapshot()
+
+	// Prefer reading external_ip from the node manager (source of truth).
+	extIP := ""
+	if s.nodeMgr != nil {
+		type settingsGetter interface {
+			GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error)
+		}
+		if sg, ok := s.nodeMgr.(settingsGetter); ok {
+			if v, _, _, err := sg.GetSettings(r.Context()); err == nil {
+				extIP = v
+			}
+		}
+	}
+	// Fallback to server cached config.
+	if extIP == "" {
+		s.cfgMu.RLock()
+		extIP = s.cfg.ExternalIP
+		s.cfgMu.RUnlock()
+	}
+
+	seen := make(map[string]struct{}, len(snapshots))
+	lines := make([]string, 0, len(snapshots))
 
 	for _, snap := range snapshots {
-		// 只导出有监听地址和端口的节点
+		// Only export nodes that are confirmed available by the latest probe.
+		if !snap.InitialCheckDone || !snap.Available {
+			continue
+		}
+		if snap.Blacklisted {
+			continue
+		}
+
 		if snap.ListenAddress == "" || snap.Port == 0 {
 			continue
 		}
 
-		// 在 hybrid 和 multi-port 模式下，导出每节点独立端口
-		// 在 pool 模式下，所有节点共享同一端口，也正常导出
 		listenAddr := snap.ListenAddress
-		if listenAddr == "0.0.0.0" || listenAddr == "::" {
-			if extIP, _, _ := s.getSettings(); extIP != "" {
-				listenAddr = extIP
-			}
+		if (listenAddr == "0.0.0.0" || listenAddr == "::") && extIP != "" {
+			listenAddr = extIP
 		}
 
 		var proxyURI string
@@ -631,25 +711,47 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		} else {
 			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
 		}
+
+		// Deduplicate (Pool mode would otherwise output the same entry N times).
+		if _, ok := seen[proxyURI]; ok {
+			continue
+		}
+		seen[proxyURI] = struct{}{}
 		lines = append(lines, proxyURI)
 	}
 
-	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
-	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+
+	if len(lines) == 0 {
+		_, _ = w.Write([]byte(""))
+		return
+	}
+	_, _ = w.Write([]byte(strings.Join(lines, "\n") + "\n"))
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if s.nodeMgr == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "节点管理未启用"})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		extIP, probeTarget, skipCertVerify := s.getSettings()
+		extIP, probeTarget, skipCertVerify, err := s.nodeMgr.GetSettings(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
 		writeJSON(w, map[string]any{
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": skipCertVerify,
 		})
+
 	case http.MethodPut:
 		var req struct {
 			ExternalIP     string `json:"external_ip"`
@@ -665,19 +767,29 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		extIP := strings.TrimSpace(req.ExternalIP)
 		probeTarget := strings.TrimSpace(req.ProbeTarget)
 
-		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify); err != nil {
+		_, _, oldSkip, err := s.nodeMgr.GetSettings(r.Context())
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
+
+		if err := s.nodeMgr.UpdateSettings(r.Context(), extIP, probeTarget, req.SkipCertVerify); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+
+		needReload := oldSkip != req.SkipCertVerify
 
 		writeJSON(w, map[string]any{
 			"message":          "设置已保存",
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": req.SkipCertVerify,
-			"need_reload":      true,
+			"need_reload":      needReload,
 		})
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}

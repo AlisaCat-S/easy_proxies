@@ -107,16 +107,25 @@ func (m *Manager) Start(ctx context.Context) error {
 	cfg := m.cfg
 	m.mu.Unlock()
 
-	var instance *box.Box
-	maxRetries := 10
+	var (
+		instance  *box.Box
+		lastErr   error
+		started   bool
+		maxRetries = 10
+	)
+
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBox(ctx, cfg)
 		if err != nil {
 			return err
 		}
+
 		if err = instance.Start(); err != nil {
+			lastErr = err
 			_ = instance.Close()
+			instance = nil
+
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
@@ -124,9 +133,19 @@ func (m *Manager) Start(ctx context.Context) error {
 					continue
 				}
 			}
+
 			return fmt.Errorf("start sing-box: %w", err)
 		}
+
+		started = true
 		break
+	}
+
+	if !started {
+		if lastErr == nil {
+			lastErr = errors.New("max retries exceeded")
+		}
+		return fmt.Errorf("start sing-box: exceeded max retries (%d): %w", maxRetries, lastErr)
 	}
 
 	m.mu.Lock()
@@ -176,6 +195,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		ctx = context.Background()
 	}
 
+	// Start a new monitor generation so we can prune stale nodes after reload succeeds.
+	var gen uint64
+	if mm := m.MonitorManager(); mm != nil {
+		gen = mm.BeginNodeSync()
+	}
+
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
 	if oldBox != nil {
@@ -188,8 +213,13 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	pool.ResetSharedStateStore()
 
-	var instance *box.Box
-	maxRetries := 10
+	var (
+		instance   *box.Box
+		lastErr    error
+		started    bool
+		maxRetries = 10
+	)
+
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBox(ctx, newCfg)
@@ -197,8 +227,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
 		}
+
 		if err = instance.Start(); err != nil {
+			lastErr = err
 			_ = instance.Close()
+			instance = nil
+
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
@@ -206,18 +240,37 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 					continue
 				}
 			}
+
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("start new box: %w", err)
 		}
+
+		started = true
 		break
+	}
+
+	if !started {
+		m.rollbackToOldConfig(ctx, oldCfg)
+		if lastErr == nil {
+			lastErr = errors.New("max retries exceeded")
+		}
+		return fmt.Errorf("start new box: exceeded max retries (%d): %w", maxRetries, lastErr)
 	}
 
 	m.applyConfigSettings(newCfg)
 
 	m.mu.Lock()
 	m.currentBox = instance
-	m.cfg = newCfg
+	// IMPORTANT: keep m.cfg pointer stable; sync content instead of replacing pointer.
+	m.syncConfigLocked(newCfg)
 	m.mu.Unlock()
+
+	// Prune monitor nodes not registered by the active config generation.
+	if gen != 0 {
+		if mm := m.MonitorManager(); mm != nil {
+			mm.PruneNodesNotInGeneration(gen)
+		}
+	}
 
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
 	return nil
@@ -229,6 +282,13 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		return
 	}
 	m.logger.Warnf("attempting rollback to previous config...")
+
+	// New generation for rollback so we can prune any nodes registered by the failed attempt.
+	var gen uint64
+	if mm := m.MonitorManager(); mm != nil {
+		gen = mm.BeginNodeSync()
+	}
+
 	instance, err := m.createBox(ctx, oldCfg)
 	if err != nil {
 		m.logger.Errorf("rollback failed to create box: %v", err)
@@ -239,10 +299,20 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		m.logger.Errorf("rollback failed to start box: %v", err)
 		return
 	}
+
 	m.mu.Lock()
 	m.currentBox = instance
-	m.cfg = oldCfg
+	// Keep pointer stable; sync content so all other holders (monitor/server/subscription) stay consistent.
+	m.syncConfigLocked(oldCfg)
 	m.mu.Unlock()
+
+	// Prune monitor nodes not registered by rollback generation.
+	if gen != 0 {
+		if mm := m.MonitorManager(); mm != nil {
+			mm.PruneNodesNotInGeneration(gen)
+		}
+	}
+
 	m.logger.Infof("rollback successful")
 }
 
@@ -474,6 +544,72 @@ func (a monitorLoggerAdapter) Warn(args ...any) {
 
 var errConfigUnavailable = errors.New("config is not initialized")
 
+func (m *Manager) GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return "", "", false, err
+		}
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.cfg == nil {
+		return "", "", false, errConfigUnavailable
+	}
+	return m.cfg.ExternalIP, m.cfg.Management.ProbeTarget, m.cfg.SkipCertVerify, nil
+}
+
+func (m *Manager) UpdateSettings(ctx context.Context, externalIP, probeTarget string, skipCertVerify bool) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	externalIP = strings.TrimSpace(externalIP)
+	probeTarget = strings.TrimSpace(probeTarget)
+
+	m.mu.Lock()
+	if m.cfg == nil {
+		m.mu.Unlock()
+		return errConfigUnavailable
+	}
+
+	oldExternalIP := m.cfg.ExternalIP
+	oldProbeTarget := m.cfg.Management.ProbeTarget
+	oldSkip := m.cfg.SkipCertVerify
+
+	// Validate/apply probe target to runtime monitor first (so invalid input won't touch config file).
+	if m.monitorMgr != nil {
+		if err := m.monitorMgr.UpdateProbeTarget(probeTarget); err != nil {
+			m.mu.Unlock()
+			return err
+		}
+	}
+
+	m.cfg.ExternalIP = externalIP
+	m.cfg.Management.ProbeTarget = probeTarget
+	m.cfg.SkipCertVerify = skipCertVerify
+
+	if err := m.cfg.SaveSettings(); err != nil {
+		// rollback in-memory
+		m.cfg.ExternalIP = oldExternalIP
+		m.cfg.Management.ProbeTarget = oldProbeTarget
+		m.cfg.SkipCertVerify = oldSkip
+		m.mu.Unlock()
+
+		// best-effort rollback runtime probe target
+		if m.monitorMgr != nil {
+			_ = m.monitorMgr.UpdateProbeTarget(oldProbeTarget)
+		}
+		return fmt.Errorf("save settings: %w", err)
+	}
+
+	m.mu.Unlock()
+	return nil
+}
+
 // ListConfigNodes returns a copy of all configured nodes.
 func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error) {
 	_ = ctx
@@ -634,6 +770,14 @@ func (m *Manager) CurrentPortMap() map[string]uint16 {
 	return m.cfg.BuildPortMap()
 }
 
+// ConfigSnapshot returns a deep copy of current config under lock.
+// The returned config is safe to read/modify without racing with manager updates.
+func (m *Manager) ConfigSnapshot() *config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.copyConfigLocked()
+}
+
 // --- Helper functions ---
 
 var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
@@ -712,6 +856,49 @@ func (m *Manager) copyConfigLocked() *config.Config {
 	cloned.Nodes = cloneNodes(m.cfg.Nodes)
 	cloned.SetFilePath(m.cfg.FilePath())
 	return &cloned
+}
+
+func cloneBoolPtr(v *bool) *bool {
+	if v == nil {
+		return nil
+	}
+	b := *v
+	return &b
+}
+
+// syncConfigLocked copies newCfg's content into the existing config pointer (m.cfg),
+// so other components holding the original *config.Config keep seeing the latest config.
+// NOTE: caller must hold m.mu.
+func (m *Manager) syncConfigLocked(newCfg *config.Config) {
+	if newCfg == nil {
+		return
+	}
+	if m.cfg == nil {
+		m.cfg = newCfg
+		return
+	}
+	// Keep pointer stable: never replace m.cfg with a different pointer.
+	if m.cfg == newCfg {
+		return
+	}
+
+	oldPath := m.cfg.FilePath()
+	newPath := newCfg.FilePath()
+
+	// Copy scalar fields.
+	*m.cfg = *newCfg
+
+	// Deep-copy slices / pointer fields to avoid sharing with newCfg (and keep behavior predictable).
+	m.cfg.Nodes = cloneNodes(newCfg.Nodes)
+	m.cfg.Subscriptions = append([]string(nil), newCfg.Subscriptions...)
+	m.cfg.Management.Enabled = cloneBoolPtr(newCfg.Management.Enabled)
+
+	// Ensure file path is preserved even if newCfg doesn't carry it.
+	if newPath != "" {
+		m.cfg.SetFilePath(newPath)
+	} else if oldPath != "" {
+		m.cfg.SetFilePath(oldPath)
+	}
 }
 
 func (m *Manager) nodeIndexLocked(name string) int {
