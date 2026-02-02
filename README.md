@@ -7,8 +7,13 @@ A proxy node pool management tool based on [sing-box](https://github.com/SagerNe
 ## Features
 
 ### Core Features
-- **Multi-Protocol Support**: VMess, VLESS, Hysteria2, Shadowsocks, Trojan
+- **Multi-Protocol Support**: VMess, VLESS, Hysteria2 (hy2://), Shadowsocks, Trojan
 - **Multiple Transports**: TCP, WebSocket, HTTP/2, gRPC, HTTPUpgrade
+- **GeoIP Region Routing** ⭐: Automatic node geolocation with region-based filtering
+  - Auto-download GeoIP database on first startup
+  - Automatic periodic updates (configurable interval, default 24h)
+  - Hot-reload without service interruption
+  - Dashboard statistics by region (JP, KR, US, HK, TW, etc.)
 - **Subscription Support**: Auto-fetch nodes from subscription links (Base64, Clash YAML, etc.)
 - **Subscription Auto-Refresh**: Automatic periodic refresh with WebUI manual trigger (⚠️ causes connection interruption)
 - **Pool Mode**: Automatic failover and load balancing
@@ -533,27 +538,44 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o eas
 
 ## Changelog
 
-### v1.1.0 (2026-02-02) - Security & Performance Release
+### v1.1.0 (2026-02-02) - GeoIP, Security & Performance Release
 
-**Security Enhancements:**
-- 🔒 Enhanced session management with automatic expiration (24h TTL) and hourly cleanup
-- 🔒 Constant-time password comparison to prevent timing attacks
-- 🔒 Semaphore-based concurrency control (CPU×4 goroutines, min 10)
-- 🔒 File locking for safe concurrent configuration writes
+**🌍 GeoIP Features (Major):**
+- ⭐ **Automatic GeoIP Database Management**
+  - Auto-download on first startup from GitHub
+  - Periodic auto-update (configurable interval, default 24h)
+  - Hot-reload without service interruption
+  - MMDB format validation and integrity checks
+- ⭐ **Region-Based Node Routing**
+  - Automatic IP geolocation for all nodes
+  - Dashboard statistics by region (JP, KR, US, HK, TW, etc.)
+  - Region filtering and sorting capabilities
+- ⭐ **hy2:// Protocol Support**
+  - Support for Hysteria2 shorthand (hy2://)
+  - Backward compatible with hysteria2://
 
-**Performance Improvements:**
-- ⚡ 50-70% faster subscription content parsing with optimized base64 detection
-- ⚡ HTTP connection pooling (100 max idle, 10 per host) reduces TIME_WAIT connections
-- ⚡ Response size limiting (10MB) prevents memory exhaustion
-- ⚡ Graceful shutdown with 30s timeout and 2s connection drain
+**🔒 Security Enhancements:**
+- Enhanced session management with automatic expiration (24h TTL) and hourly cleanup
+- Constant-time password comparison to prevent timing attacks
+- Semaphore-based concurrency control (CPU×4 goroutines, min 10)
+- File locking for safe concurrent configuration writes
 
-**Technical Details:**
+**⚡ Performance Improvements:**
+- 50-70% faster subscription content parsing with optimized base64 detection
+- HTTP connection pooling (100 max idle, 10 per host) reduces TIME_WAIT connections
+- Response size limiting (10MB) prevents memory exhaustion
+- Graceful shutdown with 30s timeout and 2s connection drain
+
+**🔧 Technical Details:**
+- Added automatic GeoIP database download and update mechanism
+- Implemented hot-reload for GeoIP database updates
 - Added `golang.org/x/sync/semaphore` for concurrency control
 - Implemented `syscall.Flock` for Unix file locking
 - Configured custom HTTP transport with optimized timeouts
 - No breaking changes - fully backward compatible
 
-**Upgrade Notes:**
+**📝 Upgrade Notes:**
+- GeoIP database will be auto-downloaded on first startup (no manual setup needed)
 - Existing sessions will be invalidated on upgrade (users need to re-login)
 - No configuration changes required
 - Recommended to restart service during low-traffic period
