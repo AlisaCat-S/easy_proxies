@@ -26,6 +26,7 @@ type Config struct {
 	Pool                PoolConfig                `yaml:"pool"`
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
+	GeoIP               GeoIPConfig               `yaml:"geoip"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`        // 手工节点文件路径
 	AliveNodesFile      string                    `yaml:"alive_nodes_file"`  // 存活节点输出文件路径，健康检查后自动写入
@@ -35,6 +36,16 @@ type Config struct {
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
 
 	filePath string `yaml:"-"` // 配置文件路径，用于保存
+}
+
+// GeoIPConfig controls GeoIP-based region routing.
+type GeoIPConfig struct {
+	Enabled            bool          `yaml:"enabled"`
+	DatabasePath       string        `yaml:"database_path"`
+	Listen             string        `yaml:"listen"`
+	Port               uint16        `yaml:"port"`
+	AutoUpdateEnabled  bool          `yaml:"auto_update_enabled"`
+	AutoUpdateInterval time.Duration `yaml:"auto_update_interval"`
 }
 
 // ListenerConfig defines how the HTTP/SOCKS proxy should listen for clients.
