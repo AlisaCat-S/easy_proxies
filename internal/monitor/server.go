@@ -3,34 +3,24 @@ package monitor
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	mathrand "math/rand"
 	"net/http"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"runtime"
 
 	"easy_proxies/internal/config"
-	"golang.org/x/sync/semaphore"
 )
 
 //go:embed assets/index.html
 var embeddedFS embed.FS
-
-// Session represents a user session with expiration.
-type Session struct {
-	Token     string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-}
 
 // NodeManager exposes config node CRUD and reload operations.
 type NodeManager interface {
@@ -39,6 +29,10 @@ type NodeManager interface {
 	UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error)
 	DeleteNode(ctx context.Context, name string) error
 	TriggerReload(ctx context.Context) error
+
+	// Settings (thread-safe; implemented by boxmgr.Manager)
+	GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error)
+	UpdateSettings(ctx context.Context, externalIP, probeTarget string, skipCertVerify bool) error
 }
 
 // Sentinel errors for node operations.
@@ -62,7 +56,7 @@ type SubscriptionStatus struct {
 	LastError     string    `json:"last_error,omitempty"`
 	RefreshCount  int       `json:"refresh_count"`
 	IsRefreshing  bool      `json:"is_refreshing"`
-	NodesModified bool      `json:"nodes_modified"` // True if nodes.txt was modified since last refresh
+	NodesModified bool      `json:"nodes_modified"` 
 }
 
 // Server exposes HTTP endpoints for monitoring.
@@ -73,15 +67,7 @@ type Server struct {
 	mgr          *Manager
 	srv          *http.Server
 	logger       *log.Logger
-
-	// Session management
-	sessionMu  sync.RWMutex
-	sessions   map[string]*Session
-	sessionTTL time.Duration
-
-	// Concurrency control
-	probeSem *semaphore.Weighted
-
+	sessionToken string // 简单的 session token，重启后失效
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
 }
@@ -94,24 +80,12 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
+	s := &Server{cfg: cfg, mgr: mgr, logger: logger}
 
-	// Calculate max concurrent probes
-	maxConcurrentProbes := int64(runtime.NumCPU() * 4)
-	if maxConcurrentProbes < 10 {
-		maxConcurrentProbes = 10
-	}
-
-	s := &Server{
-		cfg:        cfg,
-		mgr:        mgr,
-		logger:     logger,
-		sessions:   make(map[string]*Session),
-		sessionTTL: 24 * time.Hour,
-		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
-	}
-
-	// Start session cleanup goroutine
-	go s.cleanupExpiredSessions()
+	// 生成随机 session token
+	tokenBytes := make([]byte, 32)
+	rand.Read(tokenBytes)
+	s.sessionToken = hex.EncodeToString(tokenBytes)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
@@ -172,21 +146,73 @@ func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify b
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 
+	prevExternalIP := s.cfg.ExternalIP
+	prevProbeTarget := s.cfg.ProbeTarget
+	prevSkip := s.cfg.SkipCertVerify
+
+	var prevCfgSrcExternalIP string
+	var prevCfgSrcProbeTarget string
+	var prevCfgSrcSkip bool
+	if s.cfgSrc != nil {
+		prevCfgSrcExternalIP = s.cfgSrc.ExternalIP
+		prevCfgSrcProbeTarget = s.cfgSrc.Management.ProbeTarget
+		prevCfgSrcSkip = s.cfgSrc.SkipCertVerify
+	}
+
+	// Update in-memory server config first
 	s.cfg.ExternalIP = externalIP
 	s.cfg.ProbeTarget = probeTarget
 	s.cfg.SkipCertVerify = skipCertVerify
 
 	if s.cfgSrc == nil {
+		// rollback server cfg
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
 		return errors.New("配置存储未初始化")
 	}
 
+	// Update persistable config object
 	s.cfgSrc.ExternalIP = externalIP
 	s.cfgSrc.Management.ProbeTarget = probeTarget
 	s.cfgSrc.SkipCertVerify = skipCertVerify
 
+	// Apply probe target to runtime monitor manager (also validates probeTarget)
+	if s.mgr != nil {
+		if err := s.mgr.UpdateProbeTarget(probeTarget); err != nil {
+			// rollback server cfg
+			s.cfg.ExternalIP = prevExternalIP
+			s.cfg.ProbeTarget = prevProbeTarget
+			s.cfg.SkipCertVerify = prevSkip
+
+			// rollback cfgSrc
+			s.cfgSrc.ExternalIP = prevCfgSrcExternalIP
+			s.cfgSrc.Management.ProbeTarget = prevCfgSrcProbeTarget
+			s.cfgSrc.SkipCertVerify = prevCfgSrcSkip
+
+			return err
+		}
+	}
+
 	if err := s.cfgSrc.SaveSettings(); err != nil {
+		// rollback runtime manager (best-effort)
+		if s.mgr != nil {
+			_ = s.mgr.UpdateProbeTarget(prevProbeTarget)
+		}
+
+		// rollback server cfg
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
+
+		// rollback cfgSrc
+		s.cfgSrc.ExternalIP = prevCfgSrcExternalIP
+		s.cfgSrc.Management.ProbeTarget = prevCfgSrcProbeTarget
+		s.cfgSrc.SkipCertVerify = prevCfgSrcSkip
+
 		return fmt.Errorf("保存配置失败: %w", err)
 	}
+
 	return nil
 }
 
@@ -234,33 +260,43 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// 只返回初始检查通过的可用节点
-	filtered := s.mgr.SnapshotFiltered(true)
-	allNodes := s.mgr.Snapshot()
-	totalNodes := len(allNodes)
 
-	// Calculate region statistics
-	regionStats := make(map[string]int)
-	regionHealthy := make(map[string]int)
-	for _, snap := range allNodes {
-		region := snap.Region
-		if region == "" {
-			region = "other"
-		}
-		regionStats[region]++
-		// Count healthy nodes per region
-		if snap.InitialCheckDone && snap.Available && !snap.Blacklisted {
-			regionHealthy[region]++
-		}
+	// 只返回监控页需要的字段，避免 timeline/uri 等额外数据导致前端解析与渲染变慢
+	type nodeListItem struct {
+		Tag              string    `json:"tag"`
+		Name             string    `json:"name"`
+		Mode             string    `json:"mode"`
+		Port             uint16    `json:"port,omitempty"`
+		FailureCount     int       `json:"failure_count"`
+		Blacklisted      bool      `json:"blacklisted"`
+		BlacklistedUntil time.Time `json:"blacklisted_until"`
+		ActiveConnections int32    `json:"active_connections"`
+		LastError        string    `json:"last_error,omitempty"`
+		LastFailure      time.Time `json:"last_failure,omitempty"`
+		LastSuccess      time.Time `json:"last_success,omitempty"`
+		LastLatencyMs    int64     `json:"last_latency_ms"`
 	}
 
-	payload := map[string]any{
-		"nodes":          filtered,
-		"total_nodes":    totalNodes,
-		"region_stats":   regionStats,
-		"region_healthy": regionHealthy,
+	snapshots := s.mgr.SnapshotFiltered(true)
+	nodes := make([]nodeListItem, 0, len(snapshots))
+	for _, snap := range snapshots {
+		nodes = append(nodes, nodeListItem{
+			Tag:               snap.Tag,
+			Name:              snap.Name,
+			Mode:              snap.Mode,
+			Port:              snap.Port,
+			FailureCount:      snap.FailureCount,
+			Blacklisted:       snap.Blacklisted,
+			BlacklistedUntil:  snap.BlacklistedUntil,
+			ActiveConnections: snap.ActiveConnections,
+			LastError:         snap.LastError,
+			LastFailure:       snap.LastFailure,
+			LastSuccess:       snap.LastSuccess,
+			LastLatencyMs:     snap.LastLatencyMs,
+		})
 	}
-	writeJSON(w, payload)
+
+	writeJSON(w, map[string]any{"nodes": nodes})
 }
 
 func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
@@ -350,7 +386,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleProbeAll probes all nodes in batches and returns results via SSE
+// handleProbeAll probes all nodes with bounded concurrency and returns results via SSE.
 func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -361,6 +397,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -368,114 +405,172 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all nodes
 	snapshots := s.mgr.Snapshot()
 	total := len(snapshots)
 	if total == 0 {
-		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)
+		_ = writeSSE(w, map[string]any{"type": "complete", "total": 0, "success": 0, "failed": 0})
 		flusher.Flush()
 		return
 	}
 
-	// Send start event
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
+	if err := writeSSE(w, map[string]any{"type": "start", "total": total}); err != nil {
+		return
+	}
 	flusher.Flush()
 
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	const perProbeTimeout = 10 * time.Second
+
+	workerLimit := runtime.NumCPU() * 2
+	if workerLimit < 8 {
+		workerLimit = 8
+	}
+	if workerLimit > 32 {
+		workerLimit = 32
+	}
+	if workerLimit > total {
+		workerLimit = total
+	}
+
+	// Overall timeout: enough for worst-case (each probe uses full perProbeTimeout)
+	rounds := (total + workerLimit - 1) / workerLimit
+	overallTimeout := time.Duration(rounds)*perProbeTimeout + 5*time.Second
+
+	ctx, cancel := context.WithTimeout(r.Context(), overallTimeout)
 	defer cancel()
 
-	// Probe all nodes with semaphore control
 	type probeResult struct {
-		tag     string
-		name    string
-		latency int64
-		err     string
+		Tag     string
+		Name    string
+		Latency int64
+		Err     string
 	}
-	results := make(chan probeResult, total)
+
+	jobs := make(chan Snapshot)
+	results := make(chan probeResult, workerLimit)
+
 	var wg sync.WaitGroup
-
-	// Launch probes with semaphore control
-	for _, snap := range snapshots {
+	for i := 0; i < workerLimit; i++ {
 		wg.Add(1)
-		go func(snap Snapshot) {
+		go func() {
 			defer wg.Done()
-
-			// Acquire semaphore permit
-			if err := s.probeSem.Acquire(ctx, 1); err != nil {
-				results <- probeResult{
-					tag:  snap.Tag,
-					name: snap.Name,
-					err:  "probe cancelled: " + err.Error(),
+			for snap := range jobs {
+				if ctx.Err() != nil {
+					return
 				}
+
+				pctx, pcancel := context.WithTimeout(ctx, perProbeTimeout)
+				latency, err := s.mgr.Probe(pctx, snap.Tag)
+				pcancel()
+
+				res := probeResult{
+					Tag:     snap.Tag,
+					Name:    snap.Name,
+					Latency: -1,
+				}
+				if err != nil {
+					res.Err = err.Error()
+				} else {
+					ms := latency.Milliseconds()
+					if ms == 0 && latency > 0 {
+						ms = 1
+					}
+					res.Latency = ms
+				}
+
+				select {
+				case results <- res:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, snap := range snapshots {
+			select {
+			case jobs <- snap:
+			case <-ctx.Done():
 				return
 			}
-			defer s.probeSem.Release(1)
+		}
+	}()
 
-			// Execute probe
-			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
-			defer probeCancel()
-
-			latency, err := s.mgr.Probe(probeCtx, snap.Tag)
-			if err != nil {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: -1,
-					err:     err.Error(),
-				}
-			} else {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: latency.Milliseconds(),
-					err:     "",
-				}
-			}
-		}(snap)
-	}
-
-	// Wait for all probes to complete
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect results
 	successCount := 0
 	failedCount := 0
-	count := 0
+	current := 0
 
-	for result := range results {
-		count++
-		if result.err != "" {
-			failedCount++
-		} else {
-			successCount++
+	for {
+		select {
+		case <-ctx.Done():
+			remaining := total - current
+			if remaining > 0 {
+				failedCount += remaining
+				current = total
+			}
+			goto complete
+		case res, ok := <-results:
+			if !ok {
+				goto complete
+			}
+
+			current++
+			if res.Err != "" {
+				failedCount++
+			} else {
+				successCount++
+			}
+
+			progress := float64(current) / float64(total) * 100
+			event := map[string]any{
+				"type":     "progress",
+				"tag":      res.Tag,
+				"name":     res.Name,
+				"latency":  res.Latency,
+				"error":    res.Err,
+				"current":  current,
+				"total":    total,
+				"progress": progress,
+			}
+			if err := writeSSE(w, event); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
-
-		progress := float64(count) / float64(total) * 100
-		status := "success"
-		if result.err != "" {
-			status = "error"
-		}
-
-		eventData := fmt.Sprintf(`{"type":"progress","tag":"%s","name":"%s","latency":%d,"status":"%s","error":"%s","current":%d,"total":%d,"progress":%.1f}`,
-			result.tag, result.name, result.latency, status, result.err, count, total, progress)
-		fmt.Fprintf(w, "data: %s\n\n", eventData)
-		flusher.Flush()
 	}
 
-	// Send complete event
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
+complete:
+	if r.Context().Err() != nil {
+		return
+	}
+	_ = writeSSE(w, map[string]any{
+		"type":    "complete",
+		"total":   total,
+		"success": successCount,
+		"failed":  failedCount,
+	})
 	flusher.Flush()
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(payload)
+}
+
+func writeSSE(w http.ResponseWriter, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
 }
 
 // withAuth 认证中间件，如果配置了密码则需要验证
@@ -489,7 +584,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		// 检查 Cookie 中的 session token
 		cookie, err := r.Cookie("session_token")
-		if err == nil && s.validateSession(cookie.Value) {
+		if err == nil && cookie.Value == s.sessionToken {
 			next(w, r)
 			return
 		}
@@ -498,7 +593,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader != "" {
 			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if s.validateSession(token) {
+			if token == s.sessionToken {
 				next(w, r)
 				return
 			}
@@ -533,66 +628,79 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 使用 constant-time 比较防止时序攻击
-	if !secureCompareStrings(req.Password, s.cfg.Password) {
-		// 添加随机延迟防止暴力破解
-		time.Sleep(time.Duration(100+mathrand.Intn(200)) * time.Millisecond)
+	// 验证密码
+	if req.Password != s.cfg.Password {
 		w.WriteHeader(http.StatusUnauthorized)
 		writeJSON(w, map[string]any{"error": "密码错误"})
 		return
 	}
 
-	// 创建新会话
-	session, err := s.createSession()
-	if err != nil {
-		s.logger.Printf("Failed to create session: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		writeJSON(w, map[string]any{"error": "服务器错误"})
-		return
-	}
-
-	// 设置 HttpOnly Cookie
+	// 设置 cookie
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_token",
-		Value:    session.Token,
+		Value:    s.sessionToken,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   false, // 生产环境应启用 HTTPS 并设为 true
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   int(s.sessionTTL.Seconds()),
+		MaxAge:   86400 * 7, // 7天
 	})
 
 	writeJSON(w, map[string]any{
 		"message": "登录成功",
-		"token":   session.Token,
+		"token":   s.sessionToken,
 	})
 }
 
 // handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
-// 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 只导出初始检查通过的可用节点
-	snapshots := s.mgr.SnapshotFiltered(true)
-	var lines []string
+	// Export ONLY nodes that are available in the latest health-check result.
+	// Also skip blacklisted nodes.
+	snapshots := s.mgr.Snapshot()
+
+	// Prefer reading external_ip from the node manager (source of truth).
+	extIP := ""
+	if s.nodeMgr != nil {
+		type settingsGetter interface {
+			GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error)
+		}
+		if sg, ok := s.nodeMgr.(settingsGetter); ok {
+			if v, _, _, err := sg.GetSettings(r.Context()); err == nil {
+				extIP = v
+			}
+		}
+	}
+	// Fallback to server cached config.
+	if extIP == "" {
+		s.cfgMu.RLock()
+		extIP = s.cfg.ExternalIP
+		s.cfgMu.RUnlock()
+	}
+
+	seen := make(map[string]struct{}, len(snapshots))
+	lines := make([]string, 0, len(snapshots))
 
 	for _, snap := range snapshots {
-		// 只导出有监听地址和端口的节点
+		// Only export nodes that are confirmed available by the latest probe.
+		if !snap.InitialCheckDone || !snap.Available {
+			continue
+		}
+		if snap.Blacklisted {
+			continue
+		}
+
 		if snap.ListenAddress == "" || snap.Port == 0 {
 			continue
 		}
 
-		// 在 hybrid 和 multi-port 模式下，导出每节点独立端口
-		// 在 pool 模式下，所有节点共享同一端口，也正常导出
 		listenAddr := snap.ListenAddress
-		if listenAddr == "0.0.0.0" || listenAddr == "::" {
-			if extIP, _, _ := s.getSettings(); extIP != "" {
-				listenAddr = extIP
-			}
+		if (listenAddr == "0.0.0.0" || listenAddr == "::") && extIP != "" {
+			listenAddr = extIP
 		}
 
 		var proxyURI string
@@ -603,25 +711,47 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		} else {
 			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
 		}
+
+		// Deduplicate (Pool mode would otherwise output the same entry N times).
+		if _, ok := seen[proxyURI]; ok {
+			continue
+		}
+		seen[proxyURI] = struct{}{}
 		lines = append(lines, proxyURI)
 	}
 
-	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
-	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+
+	if len(lines) == 0 {
+		_, _ = w.Write([]byte(""))
+		return
+	}
+	_, _ = w.Write([]byte(strings.Join(lines, "\n") + "\n"))
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if s.nodeMgr == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "节点管理未启用"})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		extIP, probeTarget, skipCertVerify := s.getSettings()
+		extIP, probeTarget, skipCertVerify, err := s.nodeMgr.GetSettings(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
 		writeJSON(w, map[string]any{
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": skipCertVerify,
 		})
+
 	case http.MethodPut:
 		var req struct {
 			ExternalIP     string `json:"external_ip"`
@@ -637,19 +767,29 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		extIP := strings.TrimSpace(req.ExternalIP)
 		probeTarget := strings.TrimSpace(req.ProbeTarget)
 
-		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify); err != nil {
+		_, _, oldSkip, err := s.nodeMgr.GetSettings(r.Context())
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
+
+		if err := s.nodeMgr.UpdateSettings(r.Context(), extIP, probeTarget, req.SkipCertVerify); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+
+		needReload := oldSkip != req.SkipCertVerify
 
 		writeJSON(w, map[string]any{
 			"message":          "设置已保存",
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": req.SkipCertVerify,
-			"need_reload":      true,
+			"need_reload":      needReload,
 		})
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -672,13 +812,14 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
-		"enabled":       true,
-		"last_refresh":  status.LastRefresh,
-		"next_refresh":  status.NextRefresh,
-		"node_count":    status.NodeCount,
-		"last_error":    status.LastError,
-		"refresh_count": status.RefreshCount,
-		"is_refreshing": status.IsRefreshing,
+		"enabled":        true,
+		"last_refresh":   status.LastRefresh,
+		"next_refresh":   status.NextRefresh,
+		"node_count":     status.NodeCount,
+		"last_error":     status.LastError,
+		"refresh_count":  status.RefreshCount,
+		"is_refreshing":  status.IsRefreshing,
+		"nodes_modified": status.NodesModified,
 	})
 }
 
@@ -836,89 +977,4 @@ func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
 	}
 	w.WriteHeader(status)
 	writeJSON(w, map[string]any{"error": err.Error()})
-}
-
-// Session management functions
-
-// generateSessionToken creates a cryptographically secure random token.
-func (s *Server) generateSessionToken() (string, error) {
-	tokenBytes := make([]byte, 32)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return "", fmt.Errorf("failed to generate session token: %w", err)
-	}
-	return hex.EncodeToString(tokenBytes), nil
-}
-
-// createSession creates a new session with expiration.
-func (s *Server) createSession() (*Session, error) {
-	token, err := s.generateSessionToken()
-	if err != nil {
-		return nil, err
-	}
-
-	now := time.Now()
-	session := &Session{
-		Token:     token,
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.sessionTTL),
-	}
-
-	s.sessionMu.Lock()
-	s.sessions[token] = session
-	s.sessionMu.Unlock()
-
-	return session, nil
-}
-
-// validateSession checks if a session token is valid and not expired.
-func (s *Server) validateSession(token string) bool {
-	s.sessionMu.RLock()
-	session, exists := s.sessions[token]
-	s.sessionMu.RUnlock()
-
-	if !exists {
-		return false
-	}
-
-	// Check if expired
-	if time.Now().After(session.ExpiresAt) {
-		s.sessionMu.Lock()
-		delete(s.sessions, token)
-		s.sessionMu.Unlock()
-		return false
-	}
-
-	return true
-}
-
-// cleanupExpiredSessions periodically removes expired sessions.
-func (s *Server) cleanupExpiredSessions() {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now()
-		s.sessionMu.Lock()
-		for token, session := range s.sessions {
-			if now.After(session.ExpiresAt) {
-				delete(s.sessions, token)
-			}
-		}
-		s.sessionMu.Unlock()
-	}
-}
-
-// secureCompareStrings performs constant-time string comparison to prevent timing attacks.
-func secureCompareStrings(a, b string) bool {
-	aBytes := []byte(a)
-	bBytes := []byte(b)
-
-	// If lengths differ, still perform a dummy comparison to maintain constant time
-	if len(aBytes) != len(bBytes) {
-		dummy := make([]byte, 32)
-		subtle.ConstantTimeCompare(dummy, dummy)
-		return false
-	}
-
-	return subtle.ConstantTimeCompare(aBytes, bBytes) == 1
 }
