@@ -191,13 +191,16 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	m.mu.RUnlock()
 
 	if len(entries) == 0 {
-		m.writeAliveNodes()
+		m.truncateAliveNodes()
 		return
 	}
 
 	if m.logger != nil {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
+
+	// Truncate alive nodes file at the start of each health check round
+	m.truncateAliveNodes()
 
 	// 为大节点量场景提高并发，但避免过高造成抖动
 	workerLimit := runtime.NumCPU() * 4
@@ -250,10 +253,14 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 				entry.available = true
 				entry.initialCheckDone = true
 			}
+			uri := entry.info.URI
 			entry.mu.Unlock()
 
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
+			}
+			if err == nil {
+				m.appendAliveNode(uri)
 			}
 		}(e, probeFn, tag)
 	}
@@ -262,7 +269,6 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	if m.logger != nil {
 		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
-	m.writeAliveNodes()
 }
 
 // Stop stops the periodic health check.
@@ -272,39 +278,33 @@ func (m *Manager) Stop() {
 	}
 }
 
-// writeAliveNodes writes alive node URIs to the configured file after each health check.
-// Uses direct write (truncate + write) instead of atomic rename, because Docker bind-mounted
-// files don't support cross-device rename.
-func (m *Manager) writeAliveNodes() {
+// truncateAliveNodes clears the alive nodes file at the start of each health check round.
+func (m *Manager) truncateAliveNodes() {
 	if m.cfg.AliveNodesFile == "" {
 		return
 	}
-
-	snapshots := m.SnapshotFiltered(true)
-	uris := make([]string, 0, len(snapshots))
-	for _, snap := range snapshots {
-		if snap.URI != "" && snap.InitialCheckDone && snap.Available {
-			uris = append(uris, snap.URI)
+	if err := os.WriteFile(m.cfg.AliveNodesFile, nil, 0o644); err != nil {
+		if m.logger != nil {
+			m.logger.Warn("truncate alive nodes file failed: ", err)
 		}
 	}
-	sort.Strings(uris)
+}
 
-	var buf strings.Builder
-	for _, uri := range uris {
-		buf.WriteString(uri)
-		buf.WriteByte('\n')
+// appendAliveNode appends a single alive node URI to the file.
+// Safe for concurrent use from multiple goroutines via file-level append.
+func (m *Manager) appendAliveNode(uri string) {
+	if m.cfg.AliveNodesFile == "" || uri == "" {
+		return
 	}
-
-	if err := os.WriteFile(m.cfg.AliveNodesFile, []byte(buf.String()), 0o644); err != nil {
+	f, err := os.OpenFile(m.cfg.AliveNodesFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
 		if m.logger != nil {
-			m.logger.Warn("write alive nodes file failed: ", err)
+			m.logger.Warn("append alive node failed: ", err)
 		}
 		return
 	}
-
-	if m.logger != nil {
-		m.logger.Info("alive nodes written: ", len(uris), " nodes to ", m.cfg.AliveNodesFile)
-	}
+	defer f.Close()
+	_, _ = f.WriteString(uri + "\n")
 }
 
 func parsePort(value string) uint16 {
