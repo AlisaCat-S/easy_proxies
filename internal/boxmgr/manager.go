@@ -111,13 +111,21 @@ func (m *Manager) Start(ctx context.Context) error {
 		instance  *box.Box
 		lastErr   error
 		started   bool
-		maxRetries = 10
+		maxRetries = 100
 	)
 
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBox(ctx, cfg)
 		if err != nil {
+			// If a specific outbound failed to initialize, remove it and retry
+			var badOB *BadOutboundError
+			if errors.As(err, &badOB) {
+				m.logger.Warnf("invalid outbound '%s': %v, removing and retrying...", badOB.Tag, badOB.Cause)
+				cfg.Nodes = removeNodeByName(cfg.Nodes, badOB.Tag)
+				pool.ResetSharedStateStore()
+				continue
+			}
 			return err
 		}
 
@@ -217,13 +225,20 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		instance   *box.Box
 		lastErr    error
 		started    bool
-		maxRetries = 10
+		maxRetries = 100
 	)
 
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBox(ctx, newCfg)
 		if err != nil {
+			var badOB *BadOutboundError
+			if errors.As(err, &badOB) {
+				m.logger.Warnf("invalid outbound '%s': %v, removing and retrying...", badOB.Tag, badOB.Cause)
+				newCfg.Nodes = removeNodeByName(newCfg.Nodes, badOB.Tag)
+				pool.ResetSharedStateStore()
+				continue
+			}
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
 		}
@@ -379,6 +394,11 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 	instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
 	if err != nil {
+		// Try to extract the outbound tag from "initialize outbound[N]" errors
+		if idx := extractOutboundIndex(err); idx >= 0 && idx < len(opts.Outbounds) {
+			tag := opts.Outbounds[idx].Tag
+			return nil, &BadOutboundError{Tag: tag, Cause: err}
+		}
 		return nil, fmt.Errorf("create sing-box instance: %w", err)
 	}
 	return instance, nil
@@ -990,4 +1010,63 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 	}
 
 	return node, nil
+}
+
+// BadOutboundError indicates a specific outbound failed to initialize.
+type BadOutboundError struct {
+	Tag   string
+	Cause error
+}
+
+func (e *BadOutboundError) Error() string {
+	return fmt.Sprintf("bad outbound '%s': %v", e.Tag, e.Cause)
+}
+
+func (e *BadOutboundError) Unwrap() error {
+	return e.Cause
+}
+
+var outboundIndexRegex = regexp.MustCompile(`initialize outbound\[(\d+)\]`)
+
+// extractOutboundIndex parses the outbound index from sing-box "initialize outbound[N]" errors.
+func extractOutboundIndex(err error) int {
+	if err == nil {
+		return -1
+	}
+	matches := outboundIndexRegex.FindStringSubmatch(err.Error())
+	if len(matches) < 2 {
+		return -1
+	}
+	var idx int
+	fmt.Sscanf(matches[1], "%d", &idx)
+	return idx
+}
+
+// removeNodeByName removes the first node whose sanitized tag matches the given outbound tag.
+// Handles builder's counter suffix (e.g., "node-2" matches base "node").
+func removeNodeByName(nodes []config.NodeConfig, tag string) []config.NodeConfig {
+	// Strip counter suffix: "some-tag-2" -> "some-tag"
+	baseTag := tag
+	if idx := strings.LastIndex(tag, "-"); idx > 0 {
+		suffix := tag[idx+1:]
+		isNum := true
+		for _, c := range suffix {
+			if c < '0' || c > '9' {
+				isNum = false
+				break
+			}
+		}
+		if isNum {
+			baseTag = tag[:idx]
+		}
+	}
+
+	for i, n := range nodes {
+		if builder.SanitizeTag(n.Name) == tag || builder.SanitizeTag(n.Name) == baseTag {
+			log.Printf("⚠️ Removing invalid node: %s", n.Name)
+			return append(nodes[:i], nodes[i+1:]...)
+		}
+	}
+	// Fallback: not found, return as-is
+	return nodes
 }

@@ -966,6 +966,11 @@ func parseAddr(value string) (*badoption.Addr, error) {
 	return &bad, nil
 }
 
+// SanitizeTag converts a node name into a valid sing-box tag.
+func SanitizeTag(name string) string {
+	return sanitizeTag(name)
+}
+
 func sanitizeTag(name string) string {
 	lower := strings.ToLower(name)
 	lower = strings.TrimSpace(lower)
