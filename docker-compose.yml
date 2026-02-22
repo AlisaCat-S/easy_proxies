@@ -26,6 +26,7 @@ services:
     #   - 端口冲突时自动重分配到下一个可用端口
     volumes:
       # 配置文件需要可写权限以支持 WebUI 设置保存
-      # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt
+      # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt alive_nodes.txt
       - ./config.yaml:/etc/easy-proxies/config.yaml
       - ./nodes.txt:/etc/easy-proxies/nodes.txt
+      - ./alive_nodes.txt:/etc/easy-proxies/alive_nodes.txt

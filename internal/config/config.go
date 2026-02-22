@@ -28,8 +28,9 @@ type Config struct {
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
-	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
-	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
+	NodesFile           string                    `yaml:"nodes_file"`        // 节点文件路径，每行一个 URI
+	AliveNodesFile      string                    `yaml:"alive_nodes_file"`  // 存活节点输出文件路径，健康检查后自动写入
+	Subscriptions       []string                  `yaml:"subscriptions"`     // 订阅链接列表
 	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
@@ -129,6 +130,11 @@ func Load(path string) (*Config, error) {
 	if cfg.NodesFile != "" && !filepath.IsAbs(cfg.NodesFile) {
 		configDir := filepath.Dir(path)
 		cfg.NodesFile = filepath.Join(configDir, cfg.NodesFile)
+	}
+	// Resolve alive_nodes_file path relative to config file directory
+	if cfg.AliveNodesFile != "" && !filepath.IsAbs(cfg.AliveNodesFile) {
+		configDir := filepath.Dir(path)
+		cfg.AliveNodesFile = filepath.Join(configDir, cfg.AliveNodesFile)
 	}
 
 	if err := cfg.normalize(); err != nil {

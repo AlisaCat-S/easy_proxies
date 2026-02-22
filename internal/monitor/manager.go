@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -25,6 +27,7 @@ type Config struct {
 	ProxyUsername  string // 代理池的用户名（用于导出）
 	ProxyPassword  string // 代理池的密码（用于导出）
 	ExternalIP     string // 外部 IP 地址，用于导出时替换 0.0.0.0
+	AliveNodesFile string // 存活节点输出文件路径
 	SkipCertVerify bool   // 全局跳过 SSL 证书验证
 }
 
@@ -199,6 +202,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	m.mu.RUnlock()
 
 	if len(entries) == 0 {
+		m.writeAliveNodes()
 		return
 	}
 
@@ -261,12 +265,56 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	if m.logger != nil {
 		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
+	m.writeAliveNodes()
 }
 
 // Stop stops the periodic health check.
 func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
+	}
+}
+
+// writeAliveNodes writes alive node URIs to the configured file after each health check.
+// Uses atomic write (temp file + rename) to prevent readers from seeing partial content.
+func (m *Manager) writeAliveNodes() {
+	if m.cfg.AliveNodesFile == "" {
+		return
+	}
+
+	snapshots := m.SnapshotFiltered(true)
+	uris := make([]string, 0, len(snapshots))
+	for _, snap := range snapshots {
+		// 只写入已完成健康检查且确认存活的节点
+		if snap.URI != "" && snap.InitialCheckDone && snap.Available {
+			uris = append(uris, snap.URI)
+		}
+	}
+	sort.Strings(uris)
+
+	var buf strings.Builder
+	for _, uri := range uris {
+		buf.WriteString(uri)
+		buf.WriteByte('\n')
+	}
+
+	dir := filepath.Dir(m.cfg.AliveNodesFile)
+	tmpPath := filepath.Join(dir, "."+filepath.Base(m.cfg.AliveNodesFile)+".tmp")
+	if err := os.WriteFile(tmpPath, []byte(buf.String()), 0o644); err != nil {
+		if m.logger != nil {
+			m.logger.Warn("write alive nodes temp file failed: ", err)
+		}
+		return
+	}
+	if err := os.Rename(tmpPath, m.cfg.AliveNodesFile); err != nil {
+		if m.logger != nil {
+			m.logger.Warn("rename alive nodes file failed: ", err)
+		}
+		return
+	}
+
+	if m.logger != nil {
+		m.logger.Info("alive nodes written: ", len(uris), " nodes to ", m.cfg.AliveNodesFile)
 	}
 }
 
